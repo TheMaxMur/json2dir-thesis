@@ -1,0 +1,15 @@
+{
+  "schema": "json2dir-verification/v1",
+  "recorded-at": "2026-10-06T18:59:00Z",
+  "compiler": "typst 0.15.1 (unknown commit)",
+  "platform": "Darwin 27.0.0 arm64",
+  "unit": {
+    "passed": 32,
+    "failed": 0
+  },
+  "integration": {
+    "passed": 41,
+    "failed": 0
+  },
+  "scope": "Local macOS functional checks; no benchmark or formal verification claim"
+}

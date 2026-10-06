@@ -1,0 +1,140 @@
+#!/bin/sh
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+test_dir=$(mktemp -d "${TMPDIR:-/tmp}/json2dir-tests.XXXXXXXX")
+trap 'rm -rf -- "$test_dir"' EXIT
+trap 'exit 130' INT
+cli=$project_dir/bin/json2dir
+passed=0
+fail() { printf 'FAIL: %s\n' "$*" >&2; cat "$test_dir/stderr" >&2 2>/dev/null || :; exit 1; }
+ok() { passed=$((passed + 1)); printf 'PASS: %s\n' "$*"; }
+apply() { (cd "$test_dir/dest" && "$cli" < "$1") > "$test_dir/stdout" 2> "$test_dir/stderr" || fail "apply $1"; }
+reset_dest() { rm -rf "$test_dir/dest"; mkdir "$test_dir/dest"; }
+reject() { (cd "$test_dir/dest" && "$cli" < "$1") > "$test_dir/stdout" 2> "$test_dir/stderr" && fail "unexpected success: $1"; return 0; }
+typst compile --features bundle --format bundle --root "$project_dir" \
+  "$project_dir/tests/unit.typ" "$test_dir/unit" 2> "$test_dir/stderr" || fail 'Typst unit tests'
+cat "$test_dir/unit/unit-results.json"
+printf '\n'
+typst compile --features bundle --format bundle --root "$project_dir" \
+  "$project_dir/tests/fixtures.typ" "$test_dir/fixtures" 2> "$test_dir/stderr" || fail 'Typst fixtures'
+
+reset_dest
+apply "$project_dir/examples/tree.json"
+[ "$(cat "$test_dir/dest/greeting")" = 'Hello, world!' ] || fail 'greeting'
+printf 'Content.\n' > "$test_dir/expected"
+cmp "$test_dir/expected" "$test_dir/dest/dir/subfile" || fail 'nested content'
+[ -d "$test_dir/dest/dir/subdir" ] || fail 'empty nested directory'
+[ "$(readlink "$test_dir/dest/symlink")" = 'target path' ] || fail 'symlink'
+[ -x "$test_dir/dest/script" ] || fail 'script mode'
+[ "$("$test_dir/dest/script")" = 'Howdy!' ] || fail 'script execution'
+ok 'upstream example: all four node kinds'
+
+reset_dest
+apply "$test_dir/fixtures/hostile.json"
+hostile_name=$(cat "$test_dir/fixtures/hostile-name.txt")
+cmp "$test_dir/fixtures/hostile-content.bin" "$test_dir/dest/$hostile_name" || fail 'exact hostile payload bytes'
+[ ! -e "$test_dir/dest/INJECTION" ] && [ ! -e "$test_dir/dest/BACKTICK" ] || fail 'shell injection'
+[ "$(cat "$test_dir/dest/-option")" = safe ] || fail 'option-like filename'
+[ "$(cat "$test_dir/dest/café")" = 'UTF-8 survives.' ] || fail 'UTF-8'
+[ "$(cat "$test_dir/dest/back\slash")" = 'literal\backslash' ] || fail 'literal backslash'
+expected_target=$(printf "%s\n%s" "-target ' \$HOME" 'line')
+[ "$(readlink "$test_dir/dest/link")" = "$expected_target" ] || fail 'hostile symlink target'
+[ "$("$test_dir/dest/script")" = 'Executed safely.' ] || fail 'hostile fixture script'
+ok 'quoting, UTF-8, NUL bytes, literal backslashes, trailing newlines'
+
+reset_dest
+apply "$test_dir/fixtures/nul-script.json"
+cmp "$test_dir/fixtures/nul-script.bin" "$test_dir/dest/entry" || fail 'NUL script bytes'
+[ -x "$test_dir/dest/entry" ] || fail 'NUL script mode'
+ok 'executable payload preserves embedded NUL'
+
+reset_dest
+printf 'old\n' > "$test_dir/dest/entry"
+apply "$test_dir/fixtures/file.json"
+printf 'new\n' > "$test_dir/expected"
+cmp "$test_dir/expected" "$test_dir/dest/entry" || fail 'overwrite'
+ok 'replace a regular file'
+
+reset_dest
+mkdir "$test_dir/dest/entry"
+printf 'keep' > "$test_dir/dest/entry/unlisted"
+apply "$test_dir/fixtures/directory.json"
+[ -d "$test_dir/dest/entry/empty" ] && [ -f "$test_dir/dest/entry/child" ] || fail 'merge'
+[ "$(cat "$test_dir/dest/entry/unlisted")" = keep ] || fail 'unlisted entry removed'
+ok 'merge directories and preserve unlisted entries'
+
+reset_dest
+printf 'old' > "$test_dir/dest/entry"
+apply "$test_dir/fixtures/directory.json"
+[ -d "$test_dir/dest/entry" ] || fail 'file to directory'
+ok 'replace file with directory'
+
+for fixture in file directory link script; do
+  reset_dest
+  printf 'outside' > "$test_dir/outside"
+  ln -s "$test_dir/outside" "$test_dir/dest/entry"
+  apply "$test_dir/fixtures/$fixture.json"
+  [ "$(cat "$test_dir/outside")" = outside ] || fail 'symlink target modified'
+  ok "replace existing symlink with $fixture"
+done
+
+reset_dest
+mkdir "$test_dir/outside-dir"
+printf 'keep' > "$test_dir/outside-dir/untouched"
+ln -s "$test_dir/outside-dir" "$test_dir/dest/entry"
+apply "$test_dir/fixtures/directory.json"
+[ ! -L "$test_dir/dest/entry" ] && [ -d "$test_dir/dest/entry" ] || fail 'directory symlink replacement'
+[ ! -e "$test_dir/outside-dir/child" ] || fail 'directory target modified'
+ok 'replace directory symlink without traversing its target'
+
+for fixture in file script link; do
+  reset_dest
+  mkdir "$test_dir/dest/entry"
+  printf keep > "$test_dir/dest/entry/unlisted"
+  reject "$test_dir/fixtures/$fixture.json"
+  [ "$(cat "$test_dir/dest/entry/unlisted")" = keep ] || fail 'directory destroyed on error'
+  ok "reject directory to $fixture replacement"
+done
+
+reset_dest
+printf keep > "$test_dir/dest/unlisted"
+apply "$test_dir/fixtures/empty.json"
+[ "$(cat "$test_dir/dest/unlisted")" = keep ] || fail 'empty root changed existing data'
+ok 'empty root is a no-op'
+
+for input in "$test_dir/fixtures/invalid/"*.json; do
+  reset_dest
+  printf keep > "$test_dir/dest/sentinel"
+  reject "$input"
+  [ "$(cat "$test_dir/dest/sentinel")" = keep ] || fail 'invalid input modified destination'
+  [ "$(find "$test_dir/dest" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1 ] || fail 'invalid input had side effects'
+  ok "reject $(basename "$input" .json) before mutation"
+done
+
+reset_dest
+(cd "$test_dir/dest" && "$cli" --emit < "$project_dir/examples/tree.json") > "$test_dir/emitted.sh" 2> "$test_dir/stderr"
+[ ! -e "$test_dir/dest/greeting" ] || fail 'emit mutated destination'
+(cd "$test_dir/dest" && /bin/sh "$test_dir/emitted.sh") || fail 'emitted program'
+[ -f "$test_dir/dest/greeting" ] || fail 'emitted program missing files'
+ok 'emit is inert; its generated program is executable'
+
+reset_dest
+(cd "$test_dir/dest" && "$cli" --plan < "$project_dir/examples/tree.json") > "$test_dir/plan.json" 2> "$test_dir/stderr"
+[ ! -e "$test_dir/dest/greeting" ] || fail 'plan mutated destination'
+typst compile --features bundle --format bundle --root "$project_dir" \
+  "$project_dir/src/main.typ" "$test_dir/direct" 2> "$test_dir/stderr" || fail 'direct compiler export'
+cmp "$test_dir/plan.json" "$test_dir/direct/plan.json" || fail 'plan transport changed the input'
+ok 'plan mode has no destination side effects'
+
+"$cli" --unknown > "$test_dir/stdout" 2> "$test_dir/stderr" && fail 'unknown argument accepted'
+"$cli" one two > "$test_dir/stdout" 2> "$test_dir/stderr" && fail 'extra arguments accepted'
+"$cli" --help > "$test_dir/stdout" 2> "$test_dir/stderr" || fail 'help'
+ok 'CLI argument contract'
+printf 'Integration checks passed: %s\n' "$passed"
+mkdir -p "$project_dir/build"
+cp "$test_dir/unit/unit-results.json" "$project_dir/build/unit-results.json"
+typst compile --features bundle --format bundle --root "$project_dir" \
+  --input unit=/build/unit-results.json --input "integration=$passed" \
+  --input "compiler=$(typst --version)" --input "platform=$(uname -srm)" \
+  --input "recorded-at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$project_dir/tests/report.typ" "$project_dir/verification" 2> "$test_dir/stderr" || fail 'verification report'
